@@ -1,0 +1,407 @@
+name: Broker Upload
+description: Request artifact upload grant, upload artifact files through broker URLs, and register publication.
+
+inputs:
+  broker_url:
+    description: Auth broker base URL
+    required: true
+  project:
+    description: Project id configured in broker policy for this repository
+    required: true
+  session_id:
+    description: Broker session id returned by broker-auth
+    required: true
+  ecosystem:
+    description: Artifact ecosystem
+    required: true
+  channel:
+    description: Artifact channel
+    required: true
+  version:
+    description: Artifact version
+    required: true
+  user_agent:
+    description: User-Agent header sent to broker endpoints
+    required: false
+    default: auth-broker-x-ci/1.0
+  artifact_root:
+    description: Root directory allowed for artifact upload paths
+    required: false
+    default: dist
+  files_manifest_path:
+    description: Path to a JSON file that lists artifact filename, local path, and optional content_type
+    required: true
+
+outputs:
+  upload_grant_id:
+    description: Artifact upload grant id
+    value: ${{ steps.register.outputs.upload_grant_id }}
+  artifact_publication_id:
+    description: Artifact publication id
+    value: ${{ steps.register.outputs.artifact_publication_id }}
+  artifact_publication_status:
+    description: Artifact publication status
+    value: ${{ steps.register.outputs.artifact_publication_status }}
+  artifact_uploads_json:
+    description: Upload entries returned by broker
+    value: ${{ steps.request_grant.outputs.artifact_uploads_json }}
+
+runs:
+  using: composite
+  steps:
+    - name: Initialize broker upload workspace
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        WORK_DIR="$(mktemp -d "${RUNNER_TEMP:-/tmp}/broker-upload.XXXXXX")"
+        chmod 700 "$WORK_DIR"
+        echo "BROKER_UPLOAD_WORK_DIR=${WORK_DIR}" >> "$GITHUB_ENV"
+
+    - name: Prepare artifact manifest
+      id: prepare_manifest
+      shell: bash
+      env:
+        ARTIFACT_ROOT: ${{ inputs.artifact_root }}
+        FILES_MANIFEST_PATH: ${{ inputs.files_manifest_path }}
+        GITHUB_WORKSPACE: ${{ github.workspace }}
+      run: |
+        set -euo pipefail
+
+        WORK_DIR="${BROKER_UPLOAD_WORK_DIR}"
+
+        reject_header_value() {
+          local name="$1"
+          local value="$2"
+
+          if [[ "$value" == *$'\r'* || "$value" == *$'\n'* ]]; then
+            echo "${name} must not contain CR/LF" >&2
+            exit 1
+          fi
+        }
+
+        if [[ ! -f "$FILES_MANIFEST_PATH" ]]; then
+          echo "Artifact manifest file not found: $FILES_MANIFEST_PATH" >&2
+          exit 1
+        fi
+
+        jq -e 'if type != "array" or length == 0 then error("files manifest must be a non-empty array") else . end' \
+          "$FILES_MANIFEST_PATH" > "$WORK_DIR/broker-upload-manifest-input.json"
+
+        jq -e '
+          (map(.filename) | length) == (map(.filename) | unique | length)
+        ' "$WORK_DIR/broker-upload-manifest-input.json" >/dev/null || {
+          echo "files manifest contains duplicate filename" >&2
+          exit 1
+        }
+
+        case "$ARTIFACT_ROOT" in
+          /*) RESOLVED_ARTIFACT_ROOT="$ARTIFACT_ROOT" ;;
+          *) RESOLVED_ARTIFACT_ROOT="${GITHUB_WORKSPACE%/}/${ARTIFACT_ROOT}" ;;
+        esac
+
+        REAL_ROOT=$(realpath "$RESOLVED_ARTIFACT_ROOT")
+        if [[ ! -d "$REAL_ROOT" ]]; then
+          echo "artifact_root directory not found: $ARTIFACT_ROOT" >&2
+          exit 1
+        fi
+
+        ENRICHED_MANIFEST='[]'
+        while IFS= read -r ENTRY; do
+          FILENAME=$(echo "$ENTRY" | jq -r '.filename')
+          LOCAL_PATH=$(echo "$ENTRY" | jq -r '.path')
+          CONTENT_TYPE=$(echo "$ENTRY" | jq -r '.content_type // "application/octet-stream"')
+
+          if [[ -z "$FILENAME" || -z "$LOCAL_PATH" || "$FILENAME" == "null" || "$LOCAL_PATH" == "null" ]]; then
+            echo "Each manifest entry must include filename and path" >&2
+            exit 1
+          fi
+
+          if [[ ! -f "$LOCAL_PATH" ]]; then
+            echo "Artifact file not found: $LOCAL_PATH" >&2
+            exit 1
+          fi
+
+          REAL_PATH=$(realpath "$LOCAL_PATH")
+          case "$REAL_PATH" in
+            "$REAL_ROOT"/*) ;;
+            *)
+              echo "Artifact path is outside allowed artifact_root: $LOCAL_PATH" >&2
+              exit 1
+              ;;
+          esac
+
+          reject_header_value "CONTENT_TYPE" "$CONTENT_TYPE"
+
+          SHA256=$(sha256sum "$REAL_PATH" | awk '{print $1}')
+          ENRICHED_MANIFEST=$(echo "$ENRICHED_MANIFEST" | jq -c \
+            --arg filename "$FILENAME" \
+            --arg path "$REAL_PATH" \
+            --arg content_type "$CONTENT_TYPE" \
+            --arg sha256 "$SHA256" \
+            '. + [{
+              filename: $filename,
+              path: $path,
+              content_type: $content_type,
+              sha256: $sha256
+            }]')
+        done < <(jq -c '.[]' "$WORK_DIR/broker-upload-manifest-input.json")
+
+        echo "$ENRICHED_MANIFEST" > "$WORK_DIR/broker-upload-enriched-manifest.json"
+
+    - name: Request artifact upload grant
+      id: request_grant
+      shell: bash
+      env:
+        BROKER_URL: ${{ inputs.broker_url }}
+        PROJECT: ${{ inputs.project }}
+        SESSION_ID: ${{ inputs.session_id }}
+        ECOSYSTEM: ${{ inputs.ecosystem }}
+        CHANNEL: ${{ inputs.channel }}
+        VERSION: ${{ inputs.version }}
+        BROKER_USER_AGENT: ${{ inputs.user_agent }}
+      run: |
+        set -euo pipefail
+
+        WORK_DIR="${BROKER_UPLOAD_WORK_DIR}"
+
+        reject_header_value() {
+          local name="$1"
+          local value="$2"
+
+          if [[ "$value" == *$'\r'* || "$value" == *$'\n'* ]]; then
+            echo "${name} must not contain CR/LF" >&2
+            exit 1
+          fi
+        }
+
+        if [[ ! "$BROKER_URL" =~ ^https://[^[:space:]]+$ ]]; then
+          echo "broker_url must be an https URL" >&2
+          exit 1
+        fi
+
+        reject_header_value "BROKER_USER_AGENT" "$BROKER_USER_AGENT"
+
+        FILES_PAYLOAD=$(jq -c '[.[] | { filename, sha256 }]' "$WORK_DIR/broker-upload-enriched-manifest.json")
+        GRANT_PAYLOAD=$(jq -nc \
+          --arg session_id "$SESSION_ID" \
+          --arg project "$PROJECT" \
+          --arg ecosystem "$ECOSYSTEM" \
+          --arg channel "$CHANNEL" \
+          --arg version "$VERSION" \
+          --argjson files "$FILES_PAYLOAD" \
+          '{
+            session_id: $session_id,
+            project: $project,
+            ecosystem: $ecosystem,
+            channel: $channel,
+            version: $version,
+            files: $files
+          }')
+
+        GRANT_STATUS=$(curl -sS \
+          --connect-timeout 10 \
+          --max-time 60 \
+          --retry 2 \
+          --retry-delay 1 \
+          --retry-connrefused \
+          -o "$WORK_DIR/broker-upload-grant-body.json" \
+          -w "%{http_code}" \
+          -X POST "${BROKER_URL%/}/v1/grants/artifact-upload" \
+          -H "Content-Type: application/json" \
+          -H "Accept: application/json" \
+          -H "User-Agent: ${BROKER_USER_AGENT}" \
+          --data "$GRANT_PAYLOAD")
+
+        if [[ "$GRANT_STATUS" != "200" ]]; then
+          echo "broker_status=${GRANT_STATUS}" >&2
+          jq -r '.error // .message // "artifact upload grant request failed"' "$WORK_DIR/broker-upload-grant-body.json" >&2 || true
+          exit 1
+        fi
+
+        jq -e '
+          (.uploads | type == "array") and
+          ((.uploads | map(.filename) | length) == (.uploads | map(.filename) | unique | length))
+        ' "$WORK_DIR/broker-upload-grant-body.json" >/dev/null || {
+          echo "Broker upload grant returned invalid uploads list" >&2
+          exit 1
+        }
+
+        {
+          echo "upload_grant_id=$(jq -r '.grant_id' "$WORK_DIR/broker-upload-grant-body.json")"
+          echo "artifact_uploads_json<<EOF"
+          jq -c '.uploads' "$WORK_DIR/broker-upload-grant-body.json"
+          echo "EOF"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Upload artifacts through broker
+      id: upload_files
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        WORK_DIR="${BROKER_UPLOAD_WORK_DIR}"
+
+        LOCAL_COUNT=$(jq 'length' "$WORK_DIR/broker-upload-enriched-manifest.json")
+        REMOTE_COUNT=$(jq '.uploads | length' "$WORK_DIR/broker-upload-grant-body.json")
+
+        if [[ "$LOCAL_COUNT" != "$REMOTE_COUNT" ]]; then
+          echo "Upload count mismatch: local=${LOCAL_COUNT}, remote=${REMOTE_COUNT}" >&2
+          exit 1
+        fi
+
+        while IFS= read -r UPLOAD_ENTRY; do
+          FILENAME=$(echo "$UPLOAD_ENTRY" | jq -r '.filename')
+          UPLOAD_URL=$(echo "$UPLOAD_ENTRY" | jq -r '.upload_url')
+
+          if [[ ! "$UPLOAD_URL" =~ ^https://[^[:space:]]+$ ]]; then
+            echo "Upload URL must be an https URL for ${FILENAME}" >&2
+            exit 1
+          fi
+
+          LOCAL_MATCH_COUNT=$(jq -r --arg filename "$FILENAME" '[.[] | select(.filename == $filename)] | length' "$WORK_DIR/broker-upload-enriched-manifest.json")
+          if [[ "$LOCAL_MATCH_COUNT" != "1" ]]; then
+            echo "Expected exactly one local manifest entry for ${FILENAME}" >&2
+            exit 1
+          fi
+
+          LOCAL_ENTRY=$(jq -c --arg filename "$FILENAME" '.[] | select(.filename == $filename)' "$WORK_DIR/broker-upload-enriched-manifest.json")
+          LOCAL_PATH=$(echo "$LOCAL_ENTRY" | jq -r '.path')
+          CONTENT_TYPE=$(echo "$LOCAL_ENTRY" | jq -r '.content_type')
+          SHA256=$(echo "$LOCAL_ENTRY" | jq -r '.sha256')
+
+          UPLOAD_STATUS=$(curl -sS \
+            --connect-timeout 10 \
+            --max-time 300 \
+            --retry 2 \
+            --retry-delay 1 \
+            --retry-connrefused \
+            -o "$WORK_DIR/broker-upload-put-response.json" \
+            -w "%{http_code}" \
+            -X PUT \
+            -H "X-Artifact-Sha256: ${SHA256}" \
+            -H "Content-Type: ${CONTENT_TYPE}" \
+            --data-binary "@${LOCAL_PATH}" \
+            "${UPLOAD_URL}")
+
+          case "$UPLOAD_STATUS" in
+            200|201|204) ;;
+            *)
+              echo "artifact_upload_status=${UPLOAD_STATUS}" >&2
+              echo "Artifact upload failed for ${FILENAME}" >&2
+              exit 1
+              ;;
+          esac
+        done < <(jq -c '.uploads[]' "$WORK_DIR/broker-upload-grant-body.json")
+
+    - name: Register publication
+      id: register
+      shell: bash
+      env:
+        BROKER_URL: ${{ inputs.broker_url }}
+        PROJECT: ${{ inputs.project }}
+        ECOSYSTEM: ${{ inputs.ecosystem }}
+        CHANNEL: ${{ inputs.channel }}
+        VERSION: ${{ inputs.version }}
+        BROKER_USER_AGENT: ${{ inputs.user_agent }}
+      run: |
+        set -euo pipefail
+
+        WORK_DIR="${BROKER_UPLOAD_WORK_DIR}"
+
+        reject_header_value() {
+          local name="$1"
+          local value="$2"
+
+          if [[ "$value" == *$'\r'* || "$value" == *$'\n'* ]]; then
+            echo "${name} must not contain CR/LF" >&2
+            exit 1
+          fi
+        }
+
+        if [[ ! "$BROKER_URL" =~ ^https://[^[:space:]]+$ ]]; then
+          echo "broker_url must be an https URL" >&2
+          exit 1
+        fi
+
+        reject_header_value "BROKER_USER_AGENT" "$BROKER_USER_AGENT"
+
+        LOCAL_COUNT=$(jq 'length' "$WORK_DIR/broker-upload-enriched-manifest.json")
+        REMOTE_COUNT=$(jq '.uploads | length' "$WORK_DIR/broker-upload-grant-body.json")
+
+        if [[ "$LOCAL_COUNT" != "$REMOTE_COUNT" ]]; then
+          echo "Upload count mismatch before register: local=${LOCAL_COUNT}, remote=${REMOTE_COUNT}" >&2
+          exit 1
+        fi
+
+        REGISTER_FILES=$(jq -c \
+          --slurpfile uploads "$WORK_DIR/broker-upload-grant-body.json" \
+          'map(
+            . as $local
+            | ($uploads[0].uploads[] | select(.filename == $local.filename)) as $remote
+            | {
+                filename: $local.filename,
+                storage_key: $remote.storage_key,
+                sha256: $local.sha256
+              }
+          )' "$WORK_DIR/broker-upload-enriched-manifest.json")
+
+        REGISTER_COUNT=$(echo "$REGISTER_FILES" | jq 'length')
+        if [[ "$REGISTER_COUNT" != "$LOCAL_COUNT" ]]; then
+          echo "Register payload file count mismatch: local=${LOCAL_COUNT}, register=${REGISTER_COUNT}" >&2
+          exit 1
+        fi
+
+        REGISTER_PAYLOAD=$(jq -nc \
+          --arg grant_id "$(jq -r '.grant_id' "$WORK_DIR/broker-upload-grant-body.json")" \
+          --arg project "$PROJECT" \
+          --arg ecosystem "$ECOSYSTEM" \
+          --arg channel "$CHANNEL" \
+          --arg version "$VERSION" \
+          --argjson files "$REGISTER_FILES" \
+          '{
+            grant_id: $grant_id,
+            project: $project,
+            ecosystem: $ecosystem,
+            channel: $channel,
+            version: $version,
+            files: $files
+          }')
+
+        REGISTER_STATUS=$(curl -sS \
+          --connect-timeout 10 \
+          --max-time 60 \
+          --retry 2 \
+          --retry-delay 1 \
+          --retry-connrefused \
+          -o "$WORK_DIR/broker-upload-register-body.json" \
+          -w "%{http_code}" \
+          -X POST "${BROKER_URL%/}/v1/artifacts/register" \
+          -H "Content-Type: application/json" \
+          -H "Accept: application/json" \
+          -H "User-Agent: ${BROKER_USER_AGENT}" \
+          --data "$REGISTER_PAYLOAD")
+
+        if [[ "$REGISTER_STATUS" != "200" ]]; then
+          echo "broker_status=${REGISTER_STATUS}" >&2
+          jq -r '.error // .message // "artifact register request failed"' "$WORK_DIR/broker-upload-register-body.json" >&2 || true
+          exit 1
+        fi
+
+        {
+          echo "upload_grant_id=$(jq -r '.grant_id' "$WORK_DIR/broker-upload-grant-body.json")"
+          echo "artifact_publication_id=$(jq -r '.publication_id' "$WORK_DIR/broker-upload-register-body.json")"
+          echo "artifact_publication_status=$(jq -r '.status' "$WORK_DIR/broker-upload-register-body.json")"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Cleanup broker upload workspace
+      if: ${{ always() }}
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        WORK_DIR="${BROKER_UPLOAD_WORK_DIR:-}"
+
+        if [[ -n "${WORK_DIR:-}" && -d "$WORK_DIR" ]]; then
+          rm -rf "$WORK_DIR"
+        fi

@@ -1,5 +1,5 @@
 name: Broker Upload
-description: Request artifact upload grant, upload artifact files through broker URLs, and register publication.
+description: Request artifact upload grant, upload artifact files through presigned object-storage URLs, and register publication.
 
 inputs:
   broker_url:
@@ -179,6 +179,20 @@ runs:
 
         WORK_DIR="${BROKER_UPLOAD_WORK_DIR}"
 
+        print_error_response() {
+          local response_file="$1"
+          local fallback_message="$2"
+
+          if jq -e . >/dev/null 2>&1 < "$response_file"; then
+            jq -r '.error // empty, .message // empty, (if .details then (.details | tojson) else empty end)' \
+              "$response_file" >&2 || true
+            return
+          fi
+
+          echo "$fallback_message" >&2
+          sed -n '1,40p' "$response_file" >&2 || true
+        }
+
         reject_header_value() {
           local name="$1"
           local value="$2"
@@ -248,7 +262,7 @@ runs:
           echo "EOF"
         } >> "$GITHUB_OUTPUT"
 
-    - name: Upload artifacts through broker
+    - name: Upload artifacts through presigned storage URLs
       id: upload_files
       shell: bash
       run: |
@@ -280,10 +294,16 @@ runs:
 
         while IFS= read -r UPLOAD_ENTRY; do
           FILENAME=$(echo "$UPLOAD_ENTRY" | jq -r '.filename')
-          UPLOAD_URL=$(echo "$UPLOAD_ENTRY" | jq -r '.upload_url')
+          UPLOAD_URL=$(echo "$UPLOAD_ENTRY" | jq -r '.url')
+          UPLOAD_METHOD=$(echo "$UPLOAD_ENTRY" | jq -r '.method')
 
-          if [[ ! "$UPLOAD_URL" =~ ^https://[^[:space:]]+$ ]]; then
-            echo "Upload URL must be an https URL for ${FILENAME}" >&2
+          if [[ ! "$UPLOAD_URL" =~ ^https?://[^[:space:]]+$ ]]; then
+            echo "Upload URL must be an http(s) URL for ${FILENAME}" >&2
+            exit 1
+          fi
+
+          if [[ "$UPLOAD_METHOD" != "PUT" ]]; then
+            echo "Unsupported upload method ${UPLOAD_METHOD} for ${FILENAME}" >&2
             exit 1
           fi
 
@@ -297,6 +317,13 @@ runs:
           LOCAL_PATH=$(echo "$LOCAL_ENTRY" | jq -r '.path')
           CONTENT_TYPE=$(echo "$LOCAL_ENTRY" | jq -r '.content_type')
           SHA256=$(echo "$LOCAL_ENTRY" | jq -r '.sha256')
+          HEADER_ARGS=()
+
+          while IFS= read -r HEADER_ENTRY; do
+            HEADER_NAME=$(echo "$HEADER_ENTRY" | jq -r '.key')
+            HEADER_VALUE=$(echo "$HEADER_ENTRY" | jq -r '.value')
+            HEADER_ARGS+=(-H "${HEADER_NAME}: ${HEADER_VALUE}")
+          done < <(echo "$UPLOAD_ENTRY" | jq -c '.headers | to_entries[]?')
 
           UPLOAD_STATUS=$(curl -sS \
             --connect-timeout 10 \
@@ -306,9 +333,9 @@ runs:
             --retry-connrefused \
             -o "$WORK_DIR/broker-upload-put-response.json" \
             -w "%{http_code}" \
-            -X PUT \
-            -H "X-Artifact-Sha256: ${SHA256}" \
+            -X "$UPLOAD_METHOD" \
             -H "Content-Type: ${CONTENT_TYPE}" \
+            "${HEADER_ARGS[@]}" \
             --data-binary "@${LOCAL_PATH}" \
             "${UPLOAD_URL}")
 

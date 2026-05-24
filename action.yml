@@ -256,6 +256,20 @@ runs:
 
         WORK_DIR="${BROKER_UPLOAD_WORK_DIR}"
 
+        print_error_response() {
+          local response_file="$1"
+          local fallback_message="$2"
+
+          if jq -e . >/dev/null 2>&1 < "$response_file"; then
+            jq -r '.error // empty, .message // empty, (if .details then (.details | tojson) else empty end)' \
+              "$response_file" >&2 || true
+            return
+          fi
+
+          echo "$fallback_message" >&2
+          sed -n '1,40p' "$response_file" >&2 || true
+        }
+
         LOCAL_COUNT=$(jq 'length' "$WORK_DIR/broker-upload-enriched-manifest.json")
         REMOTE_COUNT=$(jq '.uploads | length' "$WORK_DIR/broker-upload-grant-body.json")
 

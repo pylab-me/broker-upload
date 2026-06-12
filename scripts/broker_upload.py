@@ -24,6 +24,7 @@ from urllib import error, parse, request
 MIN_PYTHON = (3, 14)
 JSON_CONTENT_TYPE = "application/json"
 DEFAULT_CONTENT_TYPE = "application/octet-stream"
+ZSTD_CONTENT_TYPE = "application/zstd"
 BROKER_TIMEOUT_SECONDS = 60
 UPLOAD_TIMEOUT_SECONDS = 300
 CONNECT_RETRY_ATTEMPTS = 3
@@ -137,7 +138,117 @@ def is_path_under(path: Path, root: Path) -> bool:
         return False
 
 
-def normalize_manifest(manifest_path: Path, artifact_root: str, workspace: Path) -> list[dict[str, str]]:
+def parse_bool_env(name: str, *, default: bool = False) -> bool:
+    raw = os.environ.get(name, "")
+    if not raw:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "y", "on"}:
+        return True
+    if value in {"0", "false", "no", "n", "off"}:
+        return False
+    fail(f"{name} must be a boolean: true/false")
+
+
+def parse_zstd_level(raw: str) -> int:
+    try:
+        level = int(raw)
+    except ValueError:
+        fail("compression_level must be an integer")
+
+    try:
+        from compression import zstd
+    except Exception as exc:
+        fail(f"Python 3.14 compression.zstd module is required for zstd compression: {exc}")
+
+    lower, upper = zstd.CompressionParameter.compression_level.bounds()
+    if not (lower <= level <= upper):
+        fail(f"compression_level must be between {lower} and {upper}; got {level}")
+    return level
+
+
+def compressed_filename(filename: str) -> str:
+    if filename.endswith(".zst"):
+        return filename
+    return f"{filename}.zst"
+
+
+def zstd_compress_file(source: Path, destination: Path, *, level: int) -> None:
+    try:
+        from compression import zstd
+    except Exception as exc:
+        fail(f"Python 3.14 compression.zstd module is required for zstd compression: {exc}")
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with source.open("rb") as src, destination.open("wb") as raw_dst:
+        with zstd.open(raw_dst, "wb", level=level) as zst_dst:
+            shutil.copyfileobj(src, zst_dst, length=1024 * 1024)
+
+
+def prepare_upload_file(
+    *,
+    filename: str,
+    local_path: Path,
+    content_type: str,
+    compress_uploads: bool,
+    compression_level: int,
+    tmp_dir: Path,
+    idx: int,
+) -> dict[str, str]:
+    original_size = local_path.stat().st_size
+    original_sha256 = sha256_file(local_path)
+
+    if not compress_uploads:
+        return {
+            "filename": filename,
+            "path": str(local_path),
+            "content_type": content_type,
+            "sha256": original_sha256,
+            "original_filename": filename,
+            "original_path": str(local_path),
+            "original_sha256": original_sha256,
+            "original_size": str(original_size),
+            "compression": "none",
+        }
+
+    upload_filename = compressed_filename(filename)
+    compressed_path = tmp_dir / "compressed" / f"{idx:05d}-{upload_filename.replace('/', '_')}"
+    zstd_compress_file(local_path, compressed_path, level=compression_level)
+    compressed_size = compressed_path.stat().st_size
+    compressed_sha256 = sha256_file(compressed_path)
+
+    print(
+        "compressed_artifact "
+        f"filename={filename} upload_filename={upload_filename} "
+        f"original_bytes={original_size} compressed_bytes={compressed_size} "
+        f"level={compression_level}",
+        file=sys.stderr,
+    )
+
+    return {
+        "filename": upload_filename,
+        "path": str(compressed_path),
+        "content_type": ZSTD_CONTENT_TYPE,
+        "sha256": compressed_sha256,
+        "original_filename": filename,
+        "original_path": str(local_path),
+        "original_sha256": original_sha256,
+        "original_size": str(original_size),
+        "compressed_size": str(compressed_size),
+        "compression": "zstd",
+        "compression_level": str(compression_level),
+    }
+
+
+def normalize_manifest(
+    manifest_path: Path,
+    artifact_root: str,
+    workspace: Path,
+    *,
+    compress_uploads: bool,
+    compression_level: int,
+    tmp_dir: Path,
+) -> list[dict[str, str]]:
     manifest_value = load_json_file(manifest_path)
     if not isinstance(manifest_value, list) or not manifest_value:
         fail("files manifest must be a non-empty array")
@@ -149,7 +260,7 @@ def normalize_manifest(manifest_path: Path, artifact_root: str, workspace: Path)
     if not root_path.is_dir():
         fail(f"artifact_root directory not found: {artifact_root}")
 
-    seen_filenames: set[str] = set()
+    seen_upload_filenames: set[str] = set()
     enriched: list[dict[str, str]] = []
 
     for idx, entry in enumerate(manifest_value):
@@ -167,10 +278,6 @@ def normalize_manifest(manifest_path: Path, artifact_root: str, workspace: Path)
         if not isinstance(content_type, str) or not content_type:
             fail(f"manifest entry #{idx} content_type must be a non-empty string")
 
-        if filename in seen_filenames:
-            fail(f"files manifest contains duplicate filename: {filename}")
-        seen_filenames.add(filename)
-
         reject_header_value("content_type", content_type)
 
         local_path = resolve_under_workspace(local_path_text, workspace)
@@ -179,14 +286,20 @@ def normalize_manifest(manifest_path: Path, artifact_root: str, workspace: Path)
         if not is_path_under(local_path, root_path):
             fail(f"Artifact path is outside allowed artifact_root: {local_path_text}")
 
-        enriched.append(
-            {
-                "filename": filename,
-                "path": str(local_path),
-                "content_type": content_type,
-                "sha256": sha256_file(local_path),
-            }
+        upload_entry = prepare_upload_file(
+            filename=filename,
+            local_path=local_path,
+            content_type=content_type,
+            compress_uploads=compress_uploads,
+            compression_level=compression_level,
+            tmp_dir=tmp_dir,
+            idx=idx,
         )
+        upload_filename = upload_entry["filename"]
+        if upload_filename in seen_upload_filenames:
+            fail(f"files manifest contains duplicate upload filename: {upload_filename}")
+        seen_upload_filenames.add(upload_filename)
+        enriched.append(upload_entry)
 
     return enriched
 
@@ -568,6 +681,8 @@ def main() -> int:
     user_agent = get_env("BROKER_USER_AGENT", required=False, default="auth-broker-x-ci/1.0")
     artifact_root = get_env("ARTIFACT_ROOT", required=False, default="dist")
     files_manifest_path = resolve_under_workspace(get_env("FILES_MANIFEST_PATH"), workspace)
+    compress_uploads = parse_bool_env("COMPRESS_UPLOADS", default=False)
+    compression_level = parse_zstd_level(get_env("COMPRESSION_LEVEL", required=False, default="3")) if compress_uploads else 0
 
     mask(session_id)
 
@@ -576,7 +691,14 @@ def main() -> int:
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="broker-upload.", dir=os.environ.get("RUNNER_TEMP") or None))
     try:
-        enriched = normalize_manifest(files_manifest_path, artifact_root, workspace)
+        enriched = normalize_manifest(
+            files_manifest_path,
+            artifact_root,
+            workspace,
+            compress_uploads=compress_uploads,
+            compression_level=compression_level,
+            tmp_dir=tmp_dir,
+        )
         (tmp_dir / "broker-upload-enriched-manifest.json").write_text(compact_json(enriched), encoding="utf-8")
 
         grant = request_upload_grant(

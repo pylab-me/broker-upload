@@ -1,5 +1,5 @@
 name: Broker Upload CI Bridge
-description: Request an artifact-upload grant from Auth Broker, upload files through presigned storage URLs, and register the publication.
+description: Request an artifact-upload grant from Auth Broker, optionally zstd-compress files, upload through presigned storage URLs, and register the publication.
 
 inputs:
   broker_url:
@@ -31,6 +31,14 @@ inputs:
   files_manifest_path:
     description: Path to a JSON file that lists artifact filename, local path, and optional content_type
     required: true
+  compress_uploads:
+    description: Whether to zstd-compress artifact files before requesting upload grants
+    required: false
+    default: "false"
+  compression_level:
+    description: Zstandard compression level used when compress_uploads is true
+    required: false
+    default: "3"
   cf_access_client_id:
     description: Cloudflare Access service token Client ID
     required: false
@@ -84,6 +92,8 @@ runs:
         BROKER_USER_AGENT: ${{ inputs.user_agent }}
         ARTIFACT_ROOT: ${{ inputs.artifact_root }}
         FILES_MANIFEST_PATH: ${{ inputs.files_manifest_path }}
+        COMPRESS_UPLOADS: ${{ inputs.compress_uploads }}
+        COMPRESSION_LEVEL: ${{ inputs.compression_level }}
         CF_ACCESS_CLIENT_ID: ${{ inputs.cf_access_client_id }}
         CF_ACCESS_CLIENT_SECRET: ${{ inputs.cf_access_client_secret }}
         GITHUB_WORKSPACE: ${{ github.workspace }}
